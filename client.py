@@ -1,3 +1,5 @@
+## Change to match your sharding ID (ShardId='shardId-000000000000'), For demo purpose.
+
 import json
 import boto3
 import os
