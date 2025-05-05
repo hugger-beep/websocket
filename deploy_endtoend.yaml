@@ -1,0 +1,997 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Enhanced WebSocket API with Lambda, Kinesis Data Streams backend, Cognito authentication, and enhanced security'
+
+Parameters:
+  StageName:
+    Type: String
+    Default: 'prod'
+    Description: 'Stage name for the WebSocket API'
+  
+  StreamRetentionPeriod:
+    Type: Number
+    Default: 168  # 7 days in hours
+    Description: 'Retention period for Kinesis Data Stream (hours)'
+    MinValue: 24
+    MaxValue: 168
+
+  ShardCount:
+    Type: Number
+    Default: 1
+    Description: 'Number of shards for Kinesis Data Stream'
+    MinValue: 1
+
+  ThrottlingBurstLimit:
+    Type: Number
+    Default: 100
+    Description: 'API Gateway burst limit'
+
+  ThrottlingRateLimit:
+    Type: Number
+    Default: 50
+    Description: 'API Gateway rate limit'
+
+  AllowedIPRanges:
+    Type: CommaDelimitedList
+    Description: 'List of allowed IP CIDR ranges'
+    Default: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,104.205.56.68/32"
+
+  MaxConnectionDuration:
+    Type: Number
+    Default: 7200
+    Description: 'Maximum WebSocket connection duration in seconds'
+
+  MaxConnectionCount:
+    Type: Number
+    Default: 1000
+    Description: 'Maximum number of concurrent WebSocket connections'
+
+  MessageSizeLimit:
+    Type: Number
+    Default: 32768
+    Description: 'Maximum message size in bytes (32KB)'
+
+Resources:
+  # DynamoDB Table for Connection Management
+  ConnectionTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${AWS::StackName}-connections
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: connection_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: connection_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Purpose
+          Value: WebSocketConnections
+
+  # CloudWatch Log Groups
+  APILogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/apigateway/${AWS::StackName}-websocket-api
+      RetentionInDays: 7
+
+  ProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-processor
+      RetentionInDays: 7
+
+  AuthorizerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-authorizer
+      RetentionInDays: 7
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${AWS::StackName}-user-pool
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true  # More controlled for application access
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12  # Stronger for application usage
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+      EmailConfiguration:
+        EmailSendingAccount: COGNITO_DEFAULT
+      UsernameAttributes:
+        - email
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub ${AWS::StackName}-app-client
+      GenerateSecret: true  # Important for server-side applications
+      PreventUserExistenceErrors: ENABLED
+      ExplicitAuthFlows:
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+      AccessTokenValidity: 5  # 5 hours
+      RefreshTokenValidity: 30  # 30 days
+      TokenValidityUnits:
+        AccessToken: hours
+        RefreshToken: days
+
+  # WebSocket API with Enhanced Monitoring
+  
+  WebSocketAPI:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub ${AWS::StackName}-websocket-api
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: '$request.body.action'
+      #ApiKeySelectionExpression: '$request.header.x-api-key'  # This is valid
+
+  # WebSocket Authorizer
+  WebSocketAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref WebSocketAPI
+      AuthorizerType: REQUEST
+      AuthorizerUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthorizerFunction.Arn}/invocations
+      #AuthorizerPayloadFormatVersion: '2.0'
+     # EnableSimpleResponses: true
+      IdentitySource:
+        - route.request.querystring.token
+        - route.request.header.Authorization
+      Name: !Sub ${AWS::StackName}-websocket-authorizer
+
+  # API Gateway Execution Role
+  ApiGatewayExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: WebSocketApiAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt ProcessorFunction.Arn
+                  - !GetAtt AuthorizerFunction.Arn
+
+  # Lambda Permission for API Gateway to invoke Authorizer
+  AuthorizerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref AuthorizerFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketAPI}/*
+
+  # Lambda Permission for API Gateway to invoke Processor
+  ProcessorInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ProcessorFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketAPI}/*
+
+  # DynamoDB Table for Rate Limiting (if not already defined)
+  RateLimitTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${AWS::StackName}-rate-limits
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: connection_id
+          AttributeType: S
+        - AttributeName: window
+          AttributeType: N
+      KeySchema:
+        - AttributeName: connection_id
+          KeyType: HASH
+        - AttributeName: window
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # Additional CloudWatch Alarms for API Gateway
+  WebSocketAPIErrors:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-websocket-api-errors
+      MetricName: 5XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      AlarmActions:
+        - !Ref AlertTopic
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiId
+          Value: !Ref WebSocketAPI
+        - Name: Stage
+          Value: !Ref StageName
+
+  WebSocketAPILatency:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-websocket-api-latency
+      MetricName: IntegrationLatency
+      Namespace: AWS/ApiGateway
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1000  # 1 second
+      AlarmActions:
+        - !Ref AlertTopic
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiId
+          Value: !Ref WebSocketAPI
+        - Name: Stage
+          Value: !Ref StageName
+
+# Add Stage deployment - Required for WebSocket API
+  WebSocketStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref WebSocketAPI
+      StageName: !Ref StageName
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: !Ref ThrottlingBurstLimit
+        ThrottlingRateLimit: !Ref ThrottlingRateLimit
+        DetailedMetricsEnabled: true
+      RouteSettings:
+        '$connect':  # Corrected from 'route.key/$connect'
+          ThrottlingBurstLimit: 50
+          ThrottlingRateLimit: 25
+      AccessLogSettings:
+        DestinationArn: !GetAtt APILogGroup.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","userAgent":"$context.identity.userAgent","requestTime":"$context.requestTime","routeKey":"$context.routeKey","status":"$context.status","protocol":"$context.protocol","responseLength":"$context.responseLength","integrationError":"$context.integrationErrorMessage","connectionId":"$context.connectionId","messageId":"$context.messageId","authorizer":{"userId":"$context.authorizer.userId","email":"$context.authorizer.email","principalId":"$context.authorizer.principalId"},"error":{"message":"$context.error.message","responseType":"$context.error.responseType"}}'
+
+
+# Add deployment - Required for WebSocket API
+  WebSocketDeployment:
+    Type: AWS::ApiGatewayV2::Deployment
+    DependsOn:
+      - ConnectRoute
+      - DisconnectRoute
+      - DefaultRoute
+      - GetRecordsRoute
+    Properties:
+      ApiId: !Ref WebSocketAPI
+
+
+
+  AuthorizerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import ipaddress
+          import jwt
+          import time
+          import logging
+          import boto3
+          from jwt.exceptions import InvalidTokenError
+          from typing import Dict, Any, Tuple
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def is_ip_allowed(ip: str, allowed_ranges: list) -> bool:
+              """
+              Check if IP is within allowed CIDR ranges
+              """
+              try:
+                  client_ip = ipaddress.ip_address(ip)
+                  for cidr in allowed_ranges:
+                      if client_ip in ipaddress.ip_network(cidr.strip()):
+                          return True
+                  return False
+              except ValueError as e:
+                  logger.error(f"IP validation error: {str(e)}")
+                  return False
+
+          def validate_token(token: str, user_pool_id: str) -> Tuple[bool, Dict[str, Any]]:
+              """
+              Validate Cognito JWT token
+              """
+              try:
+                  # Get Cognito user pool keys
+                  region = boto3.Session().region_name
+                  keys_url = f'https://cognito-idp.{region}.amazonaws.com/{user_pool_id}/.well-known/jwks.json'
+                  headers = {'Accept': 'application/json'}
+                  
+                  client = boto3.client('cognito-idp')
+                  response = client.get_signing_key(
+                      UserPoolId=user_pool_id,
+                      KeyId=token.split('.')[0]  # Get key ID from token header
+                  )
+                  
+                  # Decode and validate token
+                  decoded = jwt.decode(
+                      token,
+                      key=response['Key'],
+                      algorithms=['RS256'],
+                      options={
+                          'verify_exp': True,
+                          'verify_aud': True,
+                          'verify_iss': True
+                      },
+                      audience=os.environ['COGNITO_CLIENT_ID'],
+                      issuer=f'https://cognito-idp.{region}.amazonaws.com/{user_pool_id}'
+                  )
+                  
+                  # Additional custom validations
+                  if 'sub' not in decoded:
+                      return False, {"error": "Invalid token: missing sub claim"}
+                      
+                  if 'token_use' not in decoded or decoded['token_use'] != 'access':
+                      return False, {"error": "Invalid token: not an access token"}
+                      
+                  return True, decoded
+                  
+              except InvalidTokenError as e:
+                  logger.error(f"Token validation error: {str(e)}")
+                  return False, {"error": f"Token validation failed: {str(e)}"}
+              except Exception as e:
+                  logger.error(f"Unexpected error during token validation: {str(e)}")
+                  return False, {"error": "Internal authorization error"}
+
+          def check_rate_limit(connection_id: str) -> bool:
+              """
+              Implement rate limiting using DynamoDB
+              """
+              try:
+                  dynamodb = boto3.client('dynamodb')
+                  current_time = int(time.time())
+                  window_size = 60  # 1 minute window
+                  max_requests = 100  # max requests per window
+                  
+                  response = dynamodb.update_item(
+                      TableName=os.environ['RATE_LIMIT_TABLE'],
+                      Key={
+                          'connection_id': {'S': connection_id},
+                          'window': {'N': str(current_time - (current_time % window_size))}
+                      },
+                      UpdateExpression='ADD request_count :inc',
+                      ExpressionAttributeValues={
+                          ':inc': {'N': '1'},
+                          ':max': {'N': str(max_requests)}
+                      },
+                      ConditionExpression='attribute_not_exists(request_count) OR request_count < :max',
+                      ReturnValues='UPDATED_NEW'
+                  )
+                  return True
+              except dynamodb.exceptions.ConditionalCheckFailedException:
+                  return False
+              except Exception as e:
+                  logger.error(f"Rate limiting error: {str(e)}")
+                  return True  # Allow on error
+
+          def lambda_handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
+              """
+              Main handler for WebSocket authorization
+              """
+              logger.info(f"Processing authorization request: {json.dumps(event)}")
+              
+              try:
+                  # Extract request details
+                  request_context = event.get('requestContext', {})
+                  connection_id = request_context.get('connectionId', '')
+                  source_ip = request_context.get('identity', {}).get('sourceIp', '')
+                  
+                  # Get query parameters
+                  query_params = event.get('queryStringParameters', {}) or {}
+                  token = query_params.get('token', '')
+                  
+                  # Check IP restrictions
+                  allowed_ranges = os.environ['ALLOWED_IP_RANGES'].split(',')
+                  if not is_ip_allowed(source_ip, allowed_ranges):
+                      logger.warning(f"IP restricted: {source_ip}")
+                      return {
+                          "isAuthorized": False,
+                          "context": {
+                              "error": "IP address not allowed",
+                              "connectionId": connection_id
+                          }
+                      }
+                  
+                  # Check rate limiting
+                  if not check_rate_limit(connection_id):
+                      logger.warning(f"Rate limit exceeded: {connection_id}")
+                      return {
+                          "isAuthorized": False,
+                          "context": {
+                              "error": "Rate limit exceeded",
+                              "connectionId": connection_id
+                          }
+                      }
+                  
+                  # Validate token
+                  if not token:
+                      logger.warning("No token provided")
+                      return {
+                          "isAuthorized": False,
+                          "context": {
+                              "error": "No authorization token provided",
+                              "connectionId": connection_id
+                          }
+                      }
+                  
+                  is_valid, token_data = validate_token(
+                      token,
+                      os.environ['USER_POOL_ID']
+                  )
+                  
+                  if not is_valid:
+                      logger.warning(f"Token validation failed: {token_data.get('error')}")
+                      return {
+                          "isAuthorized": False,
+                          "context": {
+                              "error": token_data.get('error'),
+                              "connectionId": connection_id
+                          }
+                      }
+                  
+                  # Authorization successful
+                  return {
+                      "isAuthorized": True,
+                      "context": {
+                          "userId": token_data['sub'],
+                          "email": token_data.get('email', ''),
+                          "connectionId": connection_id,
+                          "sourceIp": source_ip,
+                          "scope": token_data.get('scope', ''),
+                          "principalId": token_data['sub']
+                      }
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Authorization error: {str(e)}")
+                  return {
+                      "isAuthorized": False,
+                      "context": {
+                          "error": "Internal authorization error",
+                          "connectionId": connection_id
+                      }
+                  }
+
+      Handler: index.lambda_handler
+      Role: !GetAtt AuthorizerRole.Arn
+      Runtime: python3.12
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          ALLOWED_IP_RANGES: !Join [",", !Ref AllowedIPRanges]
+          USER_POOL_ID: !Ref UserPool
+          COGNITO_CLIENT_ID: !Ref UserPoolClient
+          RATE_LIMIT_TABLE: !Ref RateLimitTable
+
+  AuthorizerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AuthorizerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-idp:GetSigningKey
+                Resource: !GetAtt UserPool.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt RateLimitTable.Arn
+
+
+  # Kinesis Data Stream
+  DataStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub ${AWS::StackName}-data-stream
+      RetentionPeriodHours: !Ref StreamRetentionPeriod
+      ShardCount: !Ref ShardCount
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: alias/aws/kinesis
+      Tags:
+        - Key: Purpose
+          Value: WebSocketData
+
+  # CloudWatch Alarms for Kinesis monitoring
+  StreamReadThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-stream-read-throttle
+      MetricName: ReadProvisionedThroughputExceeded
+      Namespace: AWS/Kinesis
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      AlarmActions:
+        - !Ref AlertTopic
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: StreamName
+          Value: !Ref DataStream
+
+  StreamWriteThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-stream-write-throttle
+      MetricName: WriteProvisionedThroughputExceeded
+      Namespace: AWS/Kinesis
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      AlarmActions:
+        - !Ref AlertTopic
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: StreamName
+          Value: !Ref DataStream
+
+
+  # Updated Processor Function with Message Validation and Connection Lifecycle Management
+  ProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+          import time
+          import logging
+          import bleach
+          from datetime import datetime, timezone
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          dynamodb = boto3.client('dynamodb')
+          kinesis = boto3.client('kinesis')
+
+          def validate_message(message):
+              try:
+                  # Check message size
+                  message_size = len(json.dumps(message))
+                  max_size = int(os.environ['MESSAGE_SIZE_LIMIT'])
+                  if message_size > max_size:
+                      return False, f"Message exceeds size limit of {max_size} bytes"
+
+                  # Validate required fields
+                  required_fields = ['action', 'data']
+                  if not all(field in message for field in required_fields):
+                      return False, "Missing required fields: action and data"
+
+                  # Sanitize string values
+                  sanitized_message = {}
+                  for key, value in message.items():
+                      if isinstance(value, str):
+                          sanitized_message[key] = bleach.clean(value)
+                      else:
+                          sanitized_message[key] = value
+
+                  return True, sanitized_message
+              except Exception as e:
+                  logger.error(f"Message validation error: {str(e)}")
+                  return False, "Invalid message format"
+
+          def manage_connection(connection_id, event_type, user_id=None):
+              try:
+                  current_time = int(time.time())
+                  
+                  if event_type == 'connect':
+                      # Check concurrent connections
+                      connections = dynamodb.scan(
+                          TableName=os.environ['CONNECTION_TABLE'],
+                          Select='COUNT'
+                      )
+                      if connections.get('Count', 0) >= int(os.environ['MAX_CONNECTION_COUNT']):
+                          return False, "Maximum connections reached"
+
+                      # Store connection data
+                      dynamodb.put_item(
+                          TableName=os.environ['CONNECTION_TABLE'],
+                          Item={
+                              'connection_id': {'S': connection_id},
+                              'user_id': {'S': user_id},
+                              'connected_at': {'N': str(current_time)},
+                              'ttl': {'N': str(current_time + int(os.environ['MAX_CONNECTION_DURATION']))},
+                              'last_activity': {'N': str(current_time)}
+                          }
+                      )
+                      return True, "Connection established"
+
+                  elif event_type == 'disconnect':
+                      dynamodb.delete_item(
+                          TableName=os.environ['CONNECTION_TABLE'],
+                          Key={'connection_id': {'S': connection_id}}
+                      )
+                      return True, "Connection terminated"
+
+                  elif event_type == 'activity':
+                      dynamodb.update_item(
+                          TableName=os.environ['CONNECTION_TABLE'],
+                          Key={'connection_id': {'S': connection_id}},
+                          UpdateExpression='SET last_activity = :time',
+                          ExpressionAttributeValues={':time': {'N': str(current_time)}}
+                      )
+                      return True, "Activity recorded"
+
+              except Exception as e:
+                  logger.error(f"Connection management error: {str(e)}")
+                  return False, "Connection management failed"
+          def lambda_handler(event, context):
+              try:
+                  logger.info(f"Processing event: {json.dumps(event)}")
+                  connection_id = event['requestContext']['connectionId']
+                  route_key = event['requestContext']['routeKey']
+                  
+                  # Get user context from authorizer
+                  authorizer_context = event['requestContext'].get('authorizer', {})
+                  user_id = authorizer_context.get('userId')
+                  
+                  # Handle connection lifecycle events
+                  if route_key == '$connect':
+                      success, message = manage_connection(connection_id, 'connect', user_id)
+                      return {
+                          'statusCode': 200 if success else 400,
+                          'body': message
+                      }
+                      
+                  if route_key == '$disconnect':
+                      success, message = manage_connection(connection_id, 'disconnect')
+                      return {
+                          'statusCode': 200,
+                          'body': message
+                      }
+                  
+                  # Handle data messages
+                  try:
+                      body = json.loads(event.get('body', '{}'))
+                  except json.JSONDecodeError:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({'error': 'Invalid JSON'})
+                      }
+                  
+                  # Validate and sanitize message
+                  is_valid, result = validate_message(body)
+                  if not is_valid:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({'error': result})
+                      }
+                  
+                  # Update last activity
+                  manage_connection(connection_id, 'activity')
+                  
+                  # Process the action
+                  action = result.get('action')
+                  
+                  if action == 'getRecords':
+                      try:
+                          # Get stream details
+                          stream_name = os.environ['STREAM_NAME']
+                          stream_info = kinesis.describe_stream(StreamName=stream_name)
+                          shards = stream_info['StreamDescription']['Shards']
+                          
+                          all_records = []
+                          for shard in shards:
+                              shard_iterator = kinesis.get_shard_iterator(
+                                  StreamName=stream_name,
+                                  ShardId=shard['ShardId'],
+                                  ShardIteratorType='TRIM_HORIZON'
+                              )['ShardIterator']
+                              
+                              records = kinesis.get_records(
+                                  ShardIterator=shard_iterator,
+                                  Limit=100
+                              )['Records']
+                              
+                              # Filter records for user
+                              for record in records:
+                                  data = json.loads(record['Data'].decode('utf-8'))
+                                  if data.get('metadata', {}).get('userId') == user_id:
+                                      all_records.append({
+                                          'data': data,
+                                          'sequenceNumber': record['SequenceNumber'],
+                                          'partitionKey': record['PartitionKey'],
+                                          'timestamp': record['ApproximateArrivalTimestamp'].isoformat()
+                                      })
+                          
+                          return {
+                              'statusCode': 200,
+                              'body': json.dumps({
+                                  'message': 'Records retrieved',
+                                  'records': all_records
+                              })
+                          }
+                          
+                      except Exception as e:
+                          logger.error(f"Error processing Kinesis records: {str(e)}")
+                          return {
+                              'statusCode': 500,
+                              'body': json.dumps({'error': 'Error processing records'})
+                          }
+                  
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps({'error': 'Invalid action'})
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing request: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': 'Internal server error'})
+                  }
+      Handler: index.lambda_handler
+      Role: !GetAtt ProcessorRole.Arn
+      Runtime: python3.12
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          CONNECTION_TABLE: !Ref ConnectionTable
+          STREAM_NAME: !Ref DataStream
+          MAX_CONNECTION_DURATION: !Ref MaxConnectionDuration
+          MAX_CONNECTION_COUNT: !Ref MaxConnectionCount
+          MESSAGE_SIZE_LIMIT: !Ref MessageSizeLimit
+
+  # WebSocket Routes and Integrations
+  ConnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketAPI
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ProcessorFunction.Arn}/invocations
+      IntegrationMethod: POST
+      ConnectionType: INTERNET
+      PayloadFormatVersion: '1.0'
+      TimeoutInMillis: 29000
+      CredentialsArn: !GetAtt ApiGatewayExecutionRole.Arn
+
+  DisconnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketAPI
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ProcessorFunction.Arn}/invocations
+      IntegrationMethod: POST
+      ConnectionType: INTERNET
+      PayloadFormatVersion: '1.0'
+      TimeoutInMillis: 29000
+      CredentialsArn: !GetAtt ApiGatewayExecutionRole.Arn
+
+  DefaultIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketAPI
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ProcessorFunction.Arn}/invocations
+      IntegrationMethod: POST
+      ConnectionType: INTERNET
+      PayloadFormatVersion: '1.0'
+      TimeoutInMillis: 29000
+      CredentialsArn: !GetAtt ApiGatewayExecutionRole.Arn
+
+  GetRecordsIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketAPI
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ProcessorFunction.Arn}/invocations
+      IntegrationMethod: POST
+      ConnectionType: INTERNET
+      PayloadFormatVersion: '1.0'
+      TimeoutInMillis: 29000
+      CredentialsArn: !GetAtt ApiGatewayExecutionRole.Arn
+
+  # WebSocket Routes
+  ConnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketAPI
+      RouteKey: $connect
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref WebSocketAuthorizer
+      OperationName: ConnectRoute
+      Target: !Join 
+        - '/'
+        - - 'integrations'
+          - !Ref ConnectIntegration
+
+  DisconnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketAPI
+      RouteKey: $disconnect
+      AuthorizationType: NONE
+      OperationName: DisconnectRoute
+      Target: !Join 
+        - '/'
+        - - 'integrations'
+          - !Ref DisconnectIntegration
+
+  DefaultRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketAPI
+      RouteKey: $default
+      AuthorizationType: NONE  # Changed from CUSTOM
+      OperationName: DefaultRoute
+      Target: !Join 
+        - '/'
+        - - 'integrations'
+          - !Ref DefaultIntegration
+
+  GetRecordsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketAPI
+      RouteKey: getRecords
+      AuthorizationType: NONE  # Changed from CUSTOM
+      OperationName: GetRecordsRoute
+      Target: !Join 
+        - '/'
+        - - 'integrations'
+          - !Ref GetRecordsIntegration
+
+
+
+  # CloudWatch Alarms for Monitoring
+  ConnectionLimitAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-connection-limit
+      MetricName: ConnectionCount
+      Namespace: AWS/ApiGateway
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref MaxConnectionCount
+      AlarmActions:
+        - !Ref AlertTopic
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiId
+          Value: !Ref WebSocketAPI
+        - Name: Stage
+          Value: !Ref StageName
+
+  ErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${AWS::StackName}-error-rate
+      MetricName: 5XXError
+      Namespace: AWS/ApiGateway
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      AlarmActions:
+        - !Ref AlertTopic
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: ApiId
+          Value: !Ref WebSocketAPI
+        - Name: Stage
+          Value: !Ref StageName
+
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${AWS::StackName}-alerts
+      KmsMasterKeyId: alias/aws/sns
+
+  # IAM Roles and Policies
+  ProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: WebSocketAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Scan
+                Resource: !GetAtt ConnectionTable.Arn
+              - Effect: Allow
+                Action:
+                  - kinesis:GetRecords
+                  - kinesis:GetShardIterator
+                  - kinesis:DescribeStream
+                  - kinesis:ListShards
+                Resource: !GetAtt DataStream.Arn
+
+Outputs:
+
+  UserPoolId:
+    Description: "Cognito User Pool ID"
+    Value: !Ref UserPool
+
+  UserPoolClientId:
+    Description: "Cognito User Pool Client ID"
+    Value: !Ref UserPoolClient
+
+  AlertTopicArn:
+    Description: "SNS Alert Topic ARN"
+    Value: !Ref AlertTopic
+
+  WebSocketURL:
+    Description: "WebSocket API URL"
+    Value: !Sub wss://${WebSocketAPI}.execute-api.${AWS::Region}.amazonaws.com/${StageName}
+
+  ConnectionTableName:
+    Description: "DynamoDB Connection Table Name"
+    Value: !Ref ConnectionTable
+
+  APIEndpoint:
+    Description: "API Gateway Endpoint"
+    Value: !Sub https://${WebSocketAPI}.execute-api.${AWS::Region}.amazonaws.com/${StageName}
+
+
+  DataStreamName:
+    Description: "Kinesis Data Stream Name"
+    Value: !Ref DataStream
+
+  DataStreamArn:
+    Description: "Kinesis Data Stream ARN"
+    Value: !GetAtt DataStream.Arn
